@@ -1,13 +1,13 @@
 ---
 name: polymarket-api
-description: Deep integration guide for Polymarket's CLOB API, Gamma API, and on-chain data. Use when building trading functionality, fetching market data, or implementing order execution.
+description: Deep integration guide for Polymarket's CLOB API V2, Gamma API, and on-chain data. Use when building trading functionality, fetching market data, or implementing order execution with Deposit Wallets.
 ---
 
 # Polymarket API Integration Skill
 
 ## Overview
 
-This skill provides comprehensive guidance for integrating with Polymarket's APIs and smart contracts.
+This skill provides comprehensive guidance for integrating with Polymarket's V2 APIs and smart contracts, utilizing the new Deposit Wallet architecture.
 
 ## API Endpoints
 
@@ -42,31 +42,107 @@ GET /markets             # List markets
 GET /markets/{id}        # Get market details
 ```
 
-## Python Implementation Patterns
+## Python Implementation Patterns (V2 API)
 
-### Initialize Client
+### 1. Deposit Wallet Deployment & Funding
+New API users must use a Deposit Wallet. You deploy it via the Relayer client.
+
 ```python
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
 import os
+import time
+from py_builder_relayer_client.client import RelayClient
+from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
+from py_builder_relayer_client.models import DepositWalletCall, TransactionType
+
+# Initialize Relayer Client
+builder_config = BuilderConfig(
+    local_builder_creds=BuilderApiKeyCreds(
+        key=os.environ["BUILDER_API_KEY"],
+        secret=os.environ["BUILDER_SECRET"],
+        passphrase=os.environ["BUILDER_PASS_PHRASE"],
+    )
+)
+
+relayer = RelayClient(
+    os.environ["RELAYER_URL"],
+    int(os.environ.get("CHAIN_ID", "137")),
+    os.environ["PRIVATE_KEY"],
+    builder_config,
+)
+
+# Derive and deploy deposit wallet
+deposit_wallet = relayer.get_expected_deposit_wallet()
+response = relayer.deploy_deposit_wallet()
+confirmed = response.wait()
+
+# Example: Execute a Wallet Batch (e.g., for Token Approval)
+nonce_payload = relayer.get_nonce(
+    relayer.signer.address(),
+    TransactionType.WALLET.value,
+)
+wallet_nonce = str(nonce_payload["nonce"])
+
+call = DepositWalletCall(
+    target=os.environ["PUSD_ADDRESS"],
+    value="0",
+    data="0x..." # approve_calldata
+)
+
+response = relayer.execute_deposit_wallet_batch(
+    calls=[call],
+    wallet_address=deposit_wallet,
+    nonce=wallet_nonce,
+    deadline=str(int(time.time()) + 600),
+)
+confirmed = response.wait()
+```
+
+### 2. Initialize CLOB Client (V2)
+```python
+import os
+from py_clob_client_v2 import (
+    ApiCreds,
+    AssetType,
+    BalanceAllowanceParams,
+    ClobClient,
+    OrderArgs,
+    OrderType,
+    PartialCreateOrderOptions,
+    Side,
+    SignatureTypeV2,
+)
 
 class PolymarketService:
-    def __init__(self):
-        self.client = ClobClient(
-            host="https://clob.polymarket.com",
-            key=os.getenv("POLYMARKET_PRIVATE_KEY"),
-            chain_id=137,
-            signature_type=1,
-            funder=os.getenv("POLYMARKET_FUNDER_ADDRESS")
+    def __init__(self, deposit_wallet: str):
+        # API credentials must be passed during initialization for L2 methods
+        creds = ApiCreds(
+            api_key=os.environ["CLOB_API_KEY"],
+            api_secret=os.environ["CLOB_SECRET"],
+            api_passphrase=os.environ["CLOB_PASS_PHRASE"],
         )
-        self.client.set_api_creds(
-            self.client.create_or_derive_api_creds()
+        
+        self.client = ClobClient(
+            host=os.environ.get("CLOB_API_URL", "https://clob.polymarket.com"),
+            chain_id=int(os.environ.get("CHAIN_ID", "137")),
+            key=os.environ["PRIVATE_KEY"],
+            creds=creds,
+            signature_type=SignatureTypeV2.POLY_1271, # Required for Deposit Wallets
+            funder=deposit_wallet,
+        )
+        
+    async def sync_balance(self):
+        """Sync CLOB balance after funding or changing allowances."""
+        self.client.update_balance_allowance(
+            BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=SignatureTypeV2.POLY_1271,
+            )
         )
     
     async def get_market_data(self, token_id: str) -> dict:
         """Fetch comprehensive market data."""
         return {
-            "price": self.client.get_price(token_id, "BUY"),
+            "price": self.client.get_price(token_id, Side.BUY),
             "midpoint": self.client.get_midpoint(token_id),
             "book": self.client.get_order_book(token_id),
             "spread": self.client.get_spread(token_id),
@@ -75,21 +151,27 @@ class PolymarketService:
     async def place_order(
         self,
         token_id: str,
-        side: str,
+        side: Side,
         price: float,
         size: float,
-        order_type: str = "GTC"
+        tick_size: str = "0.01",
+        neg_risk: bool = False,
+        order_type: OrderType = OrderType.GTC
     ) -> dict:
-        """Place a limit order."""
-        order = self.client.create_order(
-            OrderArgs(
+        """Place a limit order using V2 API."""
+        return self.client.create_and_post_order(
+            order_args=OrderArgs(
                 token_id=token_id,
                 price=price,
                 size=size,
                 side=side,
-            )
+            ),
+            options=PartialCreateOrderOptions(
+                tick_size=tick_size, 
+                neg_risk=neg_risk
+            ),
+            order_type=order_type,
         )
-        return self.client.post_order(order, order_type)
 ```
 
 ### WebSocket Subscription
@@ -139,7 +221,7 @@ class GammaClient:
 - **GTC** (Good Till Cancelled): Stays until filled or cancelled
 - **GTD** (Good Till Date): Expires at specified time
 - **FOK** (Fill or Kill): Must fill entirely or cancel
-- **IOC** (Immediate or Cancel): Fill what's available, cancel rest
+- **FAK** (Fill And Kill): Fills what's available, cancel rest
 
 ## Price Calculations
 
@@ -159,7 +241,7 @@ def calculate_pnl(
     side: str
 ) -> float:
     """Calculate unrealized P&L."""
-    if side == "BUY":
+    if side == "BUY" or side == Side.BUY:
         return (current_price - entry_price) * shares
     return (entry_price - current_price) * shares
 ```
@@ -167,16 +249,19 @@ def calculate_pnl(
 ## Error Handling
 
 ```python
-from py_clob_client.exceptions import PolymarketException
+from py_clob_client_v2.exceptions import PolymarketException
 
 try:
     result = client.post_order(order)
 except PolymarketException as e:
     if "INSUFFICIENT_BALANCE" in str(e):
-        # Handle insufficient funds
+        # Handle insufficient funds (ensure pUSD is in Deposit Wallet, not EOA)
         pass
     elif "INVALID_PRICE" in str(e):
         # Handle price out of range
+        pass
+    elif "INVALID_SIGNATURE" in str(e):
+        # Check if using POLY_1271 and Deposit Wallet funder
         pass
     raise
 ```
